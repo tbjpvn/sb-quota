@@ -1,41 +1,38 @@
 #!/bin/bash
 # =========================================================
-# sing-box.sh 插件: 代理流量限制
-# 作用: 在「WARP分流管理」菜单末尾追加「代理流量限制」，序号 = 该菜单当前最大序号 + 1
-#       (已装其它插件占用的序号会自动避开)
-# 安装: bash <(curl -Ls https://raw.githubusercontent.com/<用户名>/<仓库>/main/sb-quota.sh)
-# 卸载: bash <(curl -Ls 同上链接) uninstall
-# 状态: bash <(curl -Ls 同上链接) status
+# sing-box.sh 插件：代理流量限制（单文件，用链接安装，与 proxyip 插件同一套机制）
+#
+# 安装/更新: bash <(curl -Ls https://raw.githubusercontent.com/<用户名>/<仓库>/main/sb-quota.sh)
+# 卸载:      bash <(curl -Ls 同上链接) uninstall
+# 状态:      bash <(curl -Ls 同上链接) status
+#
+# 原理：sb 快捷指令每次从 GitHub 拉取最新主脚本运行。安装时把 /etc/sing-box/sb.sh 改成
+#       「拉主脚本 -> 经过各插件的注入器 -> 运行」；本插件的注入器接在已有插件(如 proxyip)之后，
+#       在「WARP分流管理」菜单末尾追加入口，序号 = 此时菜单现有最大序号 + 1。
+#       主脚本本身不被修改；注入任一步失败都原样放行，sb 不受影响。
+# 多插件：sb.sh 按文件名顺序串联 plugins/*-inject.sh (proxyip 在前、quota 在后)，
+#       需要使用已打补丁的 proxyip.sh，这样两个插件谁先装、谁后装/更新/卸载都不会互相冲掉。
 # =========================================================
-
-PLUGIN_ID="quota"
+export LANG=en_US.UTF-8
 PLUGIN_TITLE="代理流量限制 (定时流量上限，超限切断)"
-MARK="sb-plugin:${PLUGIN_ID}"
-
-work_dir="/etc/sing-box"
+work_dir="${SB_WORK_DIR:-/etc/sing-box}"
 conf_dir="${work_dir}/conf"
-sb_file="${work_dir}/sb.sh"
-DEFAULT_MAIN_URL="https://raw.githubusercontent.com/tbjpvn/sb-re/main/sing-box.sh"
+plugin_dir="${work_dir}/plugins"
+wrapper="${work_dir}/sb.sh"
+wrapper_marker="plugin wrapper"   # 子串匹配, 与 proxyip 插件共用同一种 sb.sh 包装
+inject="${plugin_dir}/quota-inject.sh"
+payload_file="${plugin_dir}/quota.sh"
 
 red()    { echo -e "\e[1;91m$1\033[0m"; }
 green()  { echo -e "\e[1;32m$1\033[0m"; }
 yellow() { echo -e "\e[1;33m$1\033[0m"; }
 die()    { red "$1"; exit 1; }
 
-[[ $EUID -ne 0 ]] && die "请在 root 用户下运行"
+[ -z "$SB_WORK_DIR" ] && [ "$EUID" -ne 0 ] && die "请在root用户下运行脚本"
 
-fetch() {
-    local url=$1 dest=$2 proxy
-    curl -sL --fail -m 60 -o "$dest" "$url" 2>/dev/null && return 0
-    for proxy in "https://gh-proxy.com/" "https://ghfast.top/" "https://github.moeyy.xyz/"; do
-        curl -sL --fail -m 60 -o "$dest" "${proxy}${url}" 2>/dev/null && return 0
-    done
-    return 1
-}
-
-# 注入到主脚本里的代码 (流量限制的全部实现)
-emit_payload() {
-cat << 'PAYLOAD_EOF'
+# 注入到主脚本里的功能代码 (流量限制全部实现)
+write_payload() {
+cat > "$payload_file" << 'QUOTA_PAYLOAD_EOF'
 # >>> sb-plugin:quota >>>
 # 插件: 代理流量限制 (由 sb-quota 插件注入, 请勿手动编辑; 卸载请运行插件脚本 uninstall)
 quota_bin="${work_dir}/quota-monitor.sh"
@@ -558,48 +555,120 @@ sbhook_outbound_flag__quota()    { quota_tag_flag "$@"; }
 sbhook_outbound_deleted__quota() { quota_forget "$@"; }
 sbhook_uninstall__quota()        { quota_service_stop >/dev/null 2>&1 || true; }
 # <<< sb-plugin:quota <<<
-PAYLOAD_EOF
+QUOTA_PAYLOAD_EOF
 }
 
-has_plugin() { grep -q "^# >>> ${MARK} >>>\$" "$sb_file" 2>/dev/null; }
+# 注入器: 从 stdin 读主脚本, 追加菜单与代码后输出到 stdout; 任何一步不满足都原样输出
+write_inject() {
+cat > "$inject" << 'QUOTA_INJECT_EOF'
+#!/bin/bash
+payload="$(cd "$(dirname "$0")" && pwd)/quota.sh"
+tmp=$(mktemp) || exit 1
+cat > "$tmp"
+out=$(mktemp) || { cat "$tmp"; rm -f "$tmp"; exit 0; }
+trap 'rm -f "$tmp" "$out"' EXIT
+passthrough() { cat "$tmp"; exit 0; }
 
-# 已安装时, 取出本插件当前占用的菜单序号
-plugin_menu_no() {
-    grep -E "^[[:space:]]+[0-9]+\).*# ${MARK}\$" "$sb_file" | head -1 | sed -E 's/^[[:space:]]*([0-9]+)\).*/\1/'
+[ -s "$payload" ] || passthrough
+grep -q '^quota_menu()' "$tmp" && passthrough          # 主脚本仍内置该功能, 不重复注入
+grep -q '^sb_run_hooks()' "$tmp" || passthrough        # 主脚本过旧, 没有插件钩子
+grep -q '^warp_manage() {' "$tmp" || passthrough
+
+# 序号 = 「WARP分流管理」菜单里现有最大序号 + 1 (已含前面插件注入的入口)
+n=$(awk '/^warp_manage\(\) \{/{f=1;next} f&&/^\}/{f=0} f&&match($0,/^[ \t]+[0-9]+\)/){s=substr($0,RSTART,RLENGTH); gsub(/[^0-9]/,"",s); if(s+0>m)m=s+0} END{print m+0}' "$tmp")
+[ "${n:-0}" -ge 1 ] || passthrough
+n=$((n+1))
+
+awk -v N="$n" -v payload="$payload" '
+/^warp_manage\(\) \{/ { inw=1 }
+inw && /^\}/ { inw=0 }
+inw && !m && /purple "0\. 返回主菜单"/ {
+    print "    green \"" N ". 代理流量限制 (插件，定时流量上限，超限切断)\""
+    print "    skyblue \"----------------------\""
+    m=1
+}
+inw && !c && /^[ \t]+0\)[ \t]+menu ;;/ {
+    print "        " N ")  quota_menu; warp_manage ;;"
+    c=1
+}
+!t && /^# ---- 参数解析入口 ----/ {
+    while ((getline line < payload) > 0) print line
+    close(payload)
+    t=1
+}
+{ print }
+END { if (!(m && c && t)) exit 3 }
+' "$tmp" > "$out" || passthrough
+
+bash -n "$out" 2>/dev/null || passthrough
+cat "$out"
+QUOTA_INJECT_EOF
+chmod +x "$inject"
 }
 
-# 读取 warp_manage 里 case 的最大数字序号, 返回 +1
-next_menu_no() {
-    awk '
-        /^warp_manage\(\) \{/ {inw=1; next}
-        inw && /^}/ {inw=0}
-        inw && match($0, /^[ \t]+[0-9]+\)/) {
-            s=substr($0, RSTART, RLENGTH); gsub(/[^0-9]/, "", s)
-            if (s+0 > max) max = s+0
-        }
-        END {print max+1}' "$sb_file"
+# 重写 sb.sh: 串联 plugins 下所有 *-inject.sh (与 proxyip 插件的写法完全一致)
+write_wrapper() {
+    local url=$1 stages="" f
+    for f in "${plugin_dir}"/*-inject.sh; do
+        [ -f "$f" ] && stages="${stages} | bash ${f}"
+    done
+    cat > "$wrapper" << EOF
+#!/usr/bin/env bash
+# sb-plugin wrapper
+bash <(curl -Ls ${url}${stages}) "\$@"
+EOF
+    chmod +x "$wrapper"
 }
 
-strip_injection() {
-    sed -i "/^# >>> ${MARK} >>>\$/,/^# <<< ${MARK} <<<\$/d" "$sb_file"
-    sed -i "/# ${MARK}\$/d" "$sb_file"
+# 取 sb.sh 里的流水线 <(curl ... | bash ...) 去掉外壳后的内容, 用于预览序号
+wrapper_pipeline() { grep -oE '<\(curl [^)]*\)' "$wrapper" | head -1 | sed -E 's/^<\(//; s/\)$//'; }
+
+preview_menu_no() {
+    local pl
+    pl=$(wrapper_pipeline)
+    [ -n "$pl" ] || return 0
+    timeout 40 bash -c "$pl" 2>/dev/null | grep -E '^[[:space:]]+[0-9]+\)[[:space:]]+quota_menu;' | head -1 | grep -oE '[0-9]+' | head -1
 }
 
-# sb.sh 若只是在线启动器(几行 curl), 换成完整的本地主脚本, 否则插件注入后重启即丢
-ensure_local_sb() {
-    if [ -f "$sb_file" ] && grep -q '^warp_manage()' "$sb_file" && grep -q '^menu()' "$sb_file"; then
-        return 0
+do_install() {
+    [ -x "${work_dir}/sing-box" ] && [ -f "$wrapper" ] || die "未检测到已安装的 sing-box / sb 快捷指令，请先用主脚本安装 sing-box。"
+    command -v jq >/dev/null 2>&1 || die "缺少 jq，请先用主脚本安装依赖。"
+    if grep -q '^warp_manage()' "$wrapper"; then
+        die "${wrapper} 是完整的主脚本而不是在线启动器，本插件只支持启动器/插件包装方式。"
     fi
-    local url tmp
-    url=$(grep -oE 'https://[^ )"]+/sing-box\.sh' "$sb_file" 2>/dev/null | head -1)
-    [ -z "$url" ] && url="$DEFAULT_MAIN_URL"
-    yellow "${sb_file} 目前只是在线启动器，先把主脚本下载到本地: ${url}"
-    tmp=$(mktemp)
-    fetch "$url" "$tmp" || { rm -f "$tmp"; die "主脚本下载失败"; }
-    bash -n "$tmp" 2>/dev/null && grep -q '^warp_manage()' "$tmp" || { rm -f "$tmp"; die "下载到的主脚本不完整或不是预期版本"; }
-    cp -f "$tmp" "$sb_file"; rm -f "$tmp"
-    chmod +x "$sb_file"
-    ln -sf "$sb_file" /usr/bin/sb
+
+    local url bak="${wrapper}.quota.bak" is_wrapped=0
+    grep -q "$wrapper_marker" "$wrapper" && is_wrapped=1
+    mkdir -p "$plugin_dir"
+    url=$(cat "${plugin_dir}/main_url" 2>/dev/null)
+    [ -z "$url" ] && url=$(grep -oE 'https://[^ )"]+' "$wrapper" | head -1)
+    url="${MAIN_URL:-$url}"
+    [ -n "$url" ] || die "未能识别主脚本地址，请指定后重试: MAIN_URL=主脚本raw链接 bash <(curl -Ls 本插件链接)"
+
+    write_payload; write_inject
+    bash -n "$payload_file" && bash -n "$inject" || die "插件文件语法检查失败，已中止（未修改 sb 快捷指令）"
+    [ -f "${plugin_dir}/main_url" ] || echo "$url" > "${plugin_dir}/main_url"
+
+    cp -f "$wrapper" "$bak"
+    # 普通启动器: 先另存原文件; 已是插件包装(含 proxyip 的)则保留已有备份
+    [ "$is_wrapped" = 0 ] && [ ! -f "${wrapper}.orig" ] && [ ! -f "${wrapper}.quota.orig" ] && cp -f "$wrapper" "${wrapper}.quota.orig"
+    write_wrapper "$url"
+    grep -q "quota-inject.sh" "$wrapper" || { cp -f "$bak" "$wrapper"; die "接入 sb.sh 失败，已还原"; }
+    chmod +x "$wrapper"
+    if [ ! -e /usr/bin/sb ] && [ -z "$SB_WORK_DIR" ]; then
+        ln -sf "$wrapper" /usr/bin/sb && touch "${plugin_dir}/quota_sb_link_created"
+    fi
+
+    green "\n代理流量限制插件安装完成。"
+    local no
+    no=$(preview_menu_no)
+    if [ -n "$no" ]; then
+        green "菜单位置: sb → 10. WARP分流管理 → ${no}. 代理流量限制 (重新运行 sb 生效)"
+    else
+        yellow "预演未生成菜单入口(主脚本不是拆分后的版本、网络取不到或结构不符)，sb 仍会照常运行，只是暂时没有该菜单。"
+    fi
+    [ -f "${work_dir}/quota.json" ] && yellow "检测到已有的流量限制数据，已原样沿用。"
+    return 0
 }
 
 reload_sb() {
@@ -611,67 +680,6 @@ reload_sb() {
     elif command -v rc-service >/dev/null 2>&1; then
         rc-service sing-box restart >/dev/null 2>&1
     fi
-}
-
-do_install() {
-    [ -x "${work_dir}/sing-box" ] || die "未检测到已安装的 sing-box (${work_dir}/sing-box)，请先安装 sing-box"
-    command -v jq >/dev/null 2>&1 || die "缺少 jq，请先安装 sing-box 主脚本会装好的依赖"
-    ensure_local_sb
-    grep -q '^sb_run_hooks()' "$sb_file" || die "主脚本版本过旧，缺少插件钩子 sb_run_hooks，请先更新为拆分后的主脚本"
-    if ! has_plugin && grep -q '^quota_menu()' "$sb_file"; then
-        die "主脚本仍内置了流量限制功能，请先换成已拆分(去掉内置流量限制)的主脚本再装插件"
-    fi
-
-    local no tmp payload
-    no=""
-    has_plugin && no=$(plugin_menu_no)
-    cp -f "$sb_file" "${sb_file}.plugin.bak"
-    strip_injection
-    [ -z "$no" ] && no=$(next_menu_no)
-    [[ "$no" =~ ^[0-9]+$ ]] && [ "$no" -ge 1 ] || { cp -f "${sb_file}.plugin.bak" "$sb_file"; die "无法确定菜单序号，已回滚"; }
-
-    tmp=$(mktemp); payload=$(mktemp)
-    emit_payload > "$payload"
-
-    # 1) WARP分流管理: 菜单项 + case 分支 (序号 = 最大序号+1)
-    awk -v n="$no" -v title="$PLUGIN_TITLE" -v mark="# ${MARK}" '
-        /^warp_manage\(\) \{/ {inw=1}
-        inw && /^}/ {inw=0}
-        inw && !m && /purple "0\. 返回主菜单"/ {
-            printf "    green \"%s. %s\" %s\n", n, title, mark
-            printf "    skyblue \"----------------------\" %s\n", mark
-            m=1
-        }
-        inw && !c && /^[ \t]+0\)[ \t]+menu ;;/ {
-            printf "        %s)  quota_menu; warp_manage ;; %s\n", n, mark
-            c=1
-        }
-        {print}
-        END {if (!m || !c) exit 3}' "$sb_file" > "$tmp" \
-        || { cp -f "${sb_file}.plugin.bak" "$sb_file"; rm -f "$tmp" "$payload"; die "没有在 warp_manage 里找到菜单锚点，主脚本结构与预期不符，已回滚"; }
-    cp -f "$tmp" "$sb_file"
-
-    # 2) 功能代码: 插入到「参数解析入口」之前
-    awk -v f="$payload" '
-        /^# ---- 参数解析入口 ----/ && !d {
-            while ((getline line < f) > 0) print line
-            d=1
-        }
-        {print}
-        END {if (!d) exit 3}' "$sb_file" > "$tmp" \
-        || { cp -f "${sb_file}.plugin.bak" "$sb_file"; rm -f "$tmp" "$payload"; die "没有找到代码注入锚点，已回滚"; }
-    cp -f "$tmp" "$sb_file"
-    rm -f "$tmp" "$payload"
-
-    if ! bash -n "$sb_file" 2>/dev/null; then
-        cp -f "${sb_file}.plugin.bak" "$sb_file"
-        die "注入后语法检查未通过，已回滚到注入前的 sb.sh"
-    fi
-    chmod +x "$sb_file"
-    green "\n安装完成：sb → 10. WARP分流管理 → ${no}. 代理流量限制"
-    green "重新运行 sb 即可看到。注入前的备份: ${sb_file}.plugin.bak"
-    if [ -f "${work_dir}/quota.json" ]; then yellow "检测到已有的流量限制数据，已原样沿用。"; fi
-    return 0
 }
 
 do_uninstall() {
@@ -708,22 +716,43 @@ do_uninstall() {
         reload_sb
     fi
 
-    if has_plugin; then
-        cp -f "$sb_file" "${sb_file}.plugin.bak"
-        strip_injection
-        if ! bash -n "$sb_file" 2>/dev/null; then
-            cp -f "${sb_file}.plugin.bak" "$sb_file"
-            die "移除注入后语法检查未通过，已回滚 sb.sh (数据与服务已清理)"
+    # 还原 sb.sh: 只摘掉本插件的注入器, 其它插件(proxyip)的注入器保留
+    local others=0 url
+    url=$(cat "${plugin_dir}/main_url" 2>/dev/null)
+    rm -f "$inject"
+    if ls "${plugin_dir}"/*-inject.sh >/dev/null 2>&1; then others=1; fi
+    if [ -f "$wrapper" ] && grep -q "$wrapper_marker" "$wrapper"; then
+        if [ "$others" = 1 ]; then
+            write_wrapper "$url"
+        elif [ -f "${wrapper}.quota.orig" ]; then
+            mv -f "${wrapper}.quota.orig" "$wrapper"
+        elif [ -f "${wrapper}.orig" ]; then
+            mv -f "${wrapper}.orig" "$wrapper"
+        elif [ -n "$url" ]; then
+            printf '#!/usr/bin/env bash\nbash <(curl -Ls %s) $1\n' "$url" > "$wrapper"
+        else
+            red "无法还原 sb.sh (缺少备份和主脚本地址)，请用主脚本重新安装以重建 sb 快捷指令"
         fi
+        chmod +x "$wrapper"
     fi
+    rm -f "${wrapper}.quota.bak"
+    [ "$others" = 0 ] && rm -f "${wrapper}.quota.orig"
+    if [ "$others" = 0 ] && [ -z "$SB_WORK_DIR" ] && [ -f "${plugin_dir}/quota_sb_link_created" ] && [ -L /usr/bin/sb ]; then
+        rm -f /usr/bin/sb
+    fi
+    rm -f "$payload_file" "${plugin_dir}/quota_sb_link_created"
+    # main_url 为各插件共用, 其它插件还在就保留
+    [ "$others" = 0 ] && rm -f "${plugin_dir}/main_url"
+    rmdir "$plugin_dir" 2>/dev/null
     green "\n插件已卸载，菜单项与数据已清除。"
 }
 
 do_status() {
-    if has_plugin; then
-        green "已安装，菜单位置: sb → 10. WARP分流管理 → $(plugin_menu_no). 代理流量限制"
+    if [ -f "$wrapper" ] && grep -q "quota-inject.sh" "$wrapper"; then
+        local no; no=$(preview_menu_no)
+        green "已接入 sb.sh，菜单位置: 10. WARP分流管理 → ${no:-?}. 代理流量限制"
     else
-        yellow "未安装 (${sb_file} 中没有本插件)"
+        yellow "未接入 (${wrapper} 里没有本插件的注入器；若刚更新过 proxyip 插件，请重新运行本插件安装命令)"
     fi
     if [ -f "${work_dir}/quota.json" ] && command -v jq >/dev/null 2>&1; then
         echo "已设置限制的出站数: $(jq '.limits | length' "${work_dir}/quota.json" 2>/dev/null)"
